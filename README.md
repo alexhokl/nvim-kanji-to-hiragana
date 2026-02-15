@@ -1,0 +1,1 @@
+# nvim-kanji-to-hiragana
