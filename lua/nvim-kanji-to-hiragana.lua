@@ -4,21 +4,149 @@ local default_options = {
   visual_mode_keymap = "<leader>hi",
   normal_mode_keymap = "<leader>hi",
   keymap_options = { noremap = true, silent = true },
+  -- Path to JmdictFurigana.json (download from
+  -- https://github.com/Doublevil/JmdictFurigana/releases).
+  dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.json",
+  -- Path to the precompiled Lua index (auto-generated, mtime-invalidated).
+  cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
+  -- "select" prompts via vim.ui.select; "first" picks the first reading; "all"
+  -- joins them with "/".
+  on_multiple_readings = "select",
+  -- If true, fall back to the legacy jisho.org HTML scraper when the kanji is
+  -- not found in the local dictionary. Requires curl.
+  fallback_to_web = false,
   url_template = "https://jisho.org/word/{}",
 }
 
--- URL encode a string (for Japanese characters)
+-- ---------------------------------------------------------------------------
+-- Index loading / building
+-- ---------------------------------------------------------------------------
+
+local function notify(msg, level)
+  vim.notify("[kanji-to-hiragana] " .. msg, level or vim.log.levels.INFO)
+end
+
+local function file_mtime(path)
+  local stat = vim.loop.fs_stat(path)
+  if not stat then return nil end
+  return stat.mtime.sec
+end
+
+local function build_index_from_json(json_path)
+  local f = io.open(json_path, "rb")
+  if not f then
+    notify(
+      "Dictionary not found at " .. json_path ..
+      ". Download JmdictFurigana.json from " ..
+      "https://github.com/Doublevil/JmdictFurigana/releases and place it there.",
+      vim.log.levels.ERROR
+    )
+    return nil
+  end
+  local raw = f:read("*a")
+  f:close()
+
+  local ok, entries = pcall(vim.json.decode, raw)
+  if not ok or type(entries) ~= "table" then
+    notify("Failed to decode " .. json_path .. ": " .. tostring(entries),
+      vim.log.levels.ERROR)
+    return nil
+  end
+
+  local idx = {}
+  for _, e in ipairs(entries) do
+    local text, reading = e.text, e.reading
+    if type(text) == "string" and type(reading) == "string" and text ~= "" then
+      local list = idx[text]
+      if not list then
+        idx[text] = { reading }
+      else
+        local seen = false
+        for _, r in ipairs(list) do
+          if r == reading then seen = true; break end
+        end
+        if not seen then list[#list + 1] = reading end
+      end
+    end
+  end
+  return idx
+end
+
+local function serialize_index(idx, path)
+  local f, err = io.open(path, "wb")
+  if not f then
+    notify("Could not write cache " .. path .. ": " .. tostring(err),
+      vim.log.levels.WARN)
+    return false
+  end
+  local parts = { "return {\n" }
+  for text, readings in pairs(idx) do
+    parts[#parts + 1] = "[" .. string.format("%q", text) .. "]={"
+    for i, r in ipairs(readings) do
+      if i > 1 then parts[#parts + 1] = "," end
+      parts[#parts + 1] = string.format("%q", r)
+    end
+    parts[#parts + 1] = "},\n"
+  end
+  parts[#parts + 1] = "}\n"
+  f:write(table.concat(parts))
+  f:close()
+  return true
+end
+
+local function load_cached_index(cache_path, json_path)
+  local cache_mtime = file_mtime(cache_path)
+  local json_mtime = file_mtime(json_path)
+  if not cache_mtime or not json_mtime then return nil end
+  if cache_mtime < json_mtime then return nil end
+  local chunk, err = loadfile(cache_path)
+  if not chunk then
+    notify("Cache load failed (" .. tostring(err) .. "); rebuilding.",
+      vim.log.levels.WARN)
+    return nil
+  end
+  local ok, idx = pcall(chunk)
+  if not ok or type(idx) ~= "table" then
+    notify("Cache invalid; rebuilding.", vim.log.levels.WARN)
+    return nil
+  end
+  return idx
+end
+
+local function load_index(force_rebuild)
+  if not force_rebuild and M._index then return M._index end
+
+  local json_path = M.options.dictionary_path
+  local cache_path = M.options.cache_path
+
+  if not force_rebuild then
+    local cached = load_cached_index(cache_path, json_path)
+    if cached then
+      M._index = cached
+      return cached
+    end
+  end
+
+  notify("Building reading index from JmdictFurigana.json (one-time, ~1s)...")
+  local idx = build_index_from_json(json_path)
+  if not idx then return nil end
+  serialize_index(idx, cache_path)
+  M._index = idx
+  return idx
+end
+
+-- ---------------------------------------------------------------------------
+-- Legacy web fallback (only used when fallback_to_web = true)
+-- ---------------------------------------------------------------------------
+
 local function url_encode(str)
-  -- Use curl's built-in URL encoding via --data-urlencode and extract the result
-  -- This avoids dependency on python3
   local encoded = ""
   for i = 1, #str do
     local byte = string.byte(str, i)
-    -- Check if it's a safe character (alphanumeric or -_.~)
-    if (byte >= 48 and byte <= 57) or                              -- 0-9
-        (byte >= 65 and byte <= 90) or                             -- A-Z
-        (byte >= 97 and byte <= 122) or                            -- a-z
-        byte == 45 or byte == 46 or byte == 95 or byte == 126 then -- -._~
+    if (byte >= 48 and byte <= 57) or
+        (byte >= 65 and byte <= 90) or
+        (byte >= 97 and byte <= 122) or
+        byte == 45 or byte == 46 or byte == 95 or byte == 126 then
       encoded = encoded .. string.char(byte)
     else
       encoded = encoded .. string.format("%%%02X", byte)
@@ -27,62 +155,25 @@ local function url_encode(str)
   return encoded
 end
 
--- Extract hiragana reading from Jisho.org HTML response
-local function parse_jisho_html(html, word)
-  -- The reading is found in the concept_light-representation div
-  -- Structure: <span class="furigana">...</span> followed by <span class="text">...</span>
-  --
-  -- Jisho.org HTML patterns:
-  -- 1. For "食べる": furigana has <span>た</span><span></span><span></span>
-  --    text has: 食<span>べ</span><span>る</span>
-  --    Result: た + べ + る = たべる
-  --
-  -- 2. For "日本": furigana has <span>にほん</span><span></span>
-  --    text has: 日本 (no spans)
-  --    Result: にほん (the furigana covers both kanji)
-  --
-  -- Strategy: Collect all furigana readings (non-empty only) and all text characters,
-  -- then build the result by using furigana for kanji and original chars for hiragana
-
-  -- First, try to find the concept_light-representation block
+local function parse_jisho_html(html)
   local representation = html:match('<div class="concept_light%-representation"[^>]*>(.-)</div>')
-  if not representation then
-    return nil
-  end
-
-  -- Normalize whitespace for easier parsing
+  if not representation then return nil end
   representation = representation:gsub("%s+", " ")
 
-  -- Extract furigana block - content between furigana span and text span
   local furigana_block = representation:match('<span class="furigana">(.-)</span> <span class="text">')
-  if not furigana_block then
-    furigana_block = representation:match('<span class="furigana">(.-)</span>')
-  end
+      or representation:match('<span class="furigana">(.-)</span>')
+  if not furigana_block then return nil end
 
-  if not furigana_block then
-    return nil
-  end
-
-  -- Extract text block - need to handle nested spans properly
-  -- Find where <span class="text"> starts and extract content until its matching </span>
   local text_tag = '<span class="text">'
   local text_start = representation:find(text_tag, 1, true)
-  if not text_start then
-    return nil
-  end
+  if not text_start then return nil end
 
   local after_text_tag = representation:sub(text_start + #text_tag)
-  local text_block = nil
-
-  -- Find the closing </span> for the text span by counting depth
-  local depth = 0
-  local pos = 1
+  local text_block, depth, pos = nil, 0, 1
   while pos <= #after_text_tag do
     local open_start = after_text_tag:find("<span", pos)
     local close_start = after_text_tag:find("</span>", pos)
-
     if not close_start then break end
-
     if open_start and open_start < close_start then
       depth = depth + 1
       pos = open_start + 5
@@ -95,15 +186,9 @@ local function parse_jisho_html(html, word)
       pos = close_start + 7
     end
   end
-
-  if not text_block then
-    return nil
-  end
-
-  -- Trim whitespace from text_block
+  if not text_block then return nil end
   text_block = text_block:gsub("^%s+", ""):gsub("%s+$", "")
 
-  -- Collect all non-empty furigana readings in order
   local furigana_readings = {}
   for span_content in furigana_block:gmatch('<span[^>]*>(.-)</span>') do
     if span_content ~= "" then
@@ -111,160 +196,186 @@ local function parse_jisho_html(html, word)
     end
   end
 
-  -- Collect text parts: hiragana/katakana are in <span>X</span>, kanji are raw text
-  -- We need to know which parts are hiragana (in spans) vs kanji (raw)
   local text_parts = {}
   pos = 1
   while pos <= #text_block do
     local span_start, span_end, span_content = text_block:find('<span>(.-)</span>', pos)
     if span_start == pos then
-      -- This is hiragana/katakana in a span - use as-is
       table.insert(text_parts, { content = span_content, is_kana = true })
       pos = span_end + 1
     else
-      -- Raw text before the next span (or end of string) - these are kanji
       local next_span = text_block:find('<span>', pos)
-      local chunk
-      if next_span then
-        chunk = text_block:sub(pos, next_span - 1)
-      else
-        chunk = text_block:sub(pos)
-      end
-      -- The entire chunk of kanji has a single furigana reading
+      local chunk = next_span and text_block:sub(pos, next_span - 1) or text_block:sub(pos)
       chunk = chunk:gsub("^%s+", ""):gsub("%s+$", "")
       if chunk ~= "" then
         table.insert(text_parts, { content = chunk, is_kana = false })
       end
-      if next_span then
-        pos = next_span
-      else
-        break
-      end
+      if next_span then pos = next_span else break end
     end
   end
 
-  -- Build the result: for kanji parts use furigana readings, for kana use as-is
-  -- When multiple consecutive kanji share furigana readings, concatenate all remaining readings
-  local result = {}
-  local furigana_idx = 1
+  local result, furigana_idx = {}, 1
   for i, part in ipairs(text_parts) do
     if part.is_kana then
-      -- Hiragana/katakana - use as-is
       table.insert(result, part.content)
     else
-      -- Kanji chunk - use all remaining furigana readings up to the next kana part
-      -- Count how many furigana readings belong to this kanji chunk
-      -- by looking ahead to see if there's another kanji chunk after the next kana parts
       local readings_for_chunk = {}
-
-      -- Find the next kanji chunk index (if any)
-      local next_kanji_idx = nil
-      for j = i + 1, #text_parts do
-        if not text_parts[j].is_kana then
-          next_kanji_idx = j
-          break
-        end
-      end
-
-      -- Calculate how many furigana readings are left for remaining kanji chunks
       local remaining_kanji_chunks = 0
       for j = i + 1, #text_parts do
         if not text_parts[j].is_kana then
           remaining_kanji_chunks = remaining_kanji_chunks + 1
         end
       end
-
-      -- This chunk gets: (remaining furigana) - (furigana needed for remaining kanji chunks)
       local remaining_furigana = #furigana_readings - furigana_idx + 1
       local readings_to_take = remaining_furigana - remaining_kanji_chunks
       if readings_to_take < 1 then readings_to_take = 1 end
-
       for _ = 1, readings_to_take do
         if furigana_idx <= #furigana_readings then
           table.insert(readings_for_chunk, furigana_readings[furigana_idx])
           furigana_idx = furigana_idx + 1
         end
       end
-
       if #readings_for_chunk > 0 then
         table.insert(result, table.concat(readings_for_chunk, ""))
       else
-        -- Fallback: no furigana available, use original
         table.insert(result, part.content)
       end
     end
   end
 
   local hiragana = table.concat(result, "")
-  if hiragana == "" then
-    return nil
-  end
+  if hiragana == "" then return nil end
   return hiragana
 end
 
-local function lookup_kanji(kanji)
-  local encoded_kanji = url_encode(kanji)
-  -- Use plain string replacement to avoid % being interpreted as capture reference
-  local url = M.options.url_template:gsub("{}", encoded_kanji:gsub("%%", "%%%%"))
+local function web_lookup_kanji(kanji)
+  local encoded = url_encode(kanji)
+  local url = M.options.url_template:gsub("{}", (encoded:gsub("%%", "%%%%")))
   local result = vim.fn.system({ "curl", "-s", "-L", url })
   if vim.v.shell_error ~= 0 then
-    print("Error fetching data: " .. result)
+    notify("Error fetching data: " .. result, vim.log.levels.ERROR)
     return nil
+  end
+  return parse_jisho_html(result)
+end
+
+-- ---------------------------------------------------------------------------
+-- Lookup (async-aware due to vim.ui.select)
+-- ---------------------------------------------------------------------------
+
+local function lookup_kanji_async(kanji, callback)
+  local idx = load_index()
+  local readings = idx and idx[kanji] or nil
+
+  if not readings or #readings == 0 then
+    if M.options.fallback_to_web then
+      local r = web_lookup_kanji(kanji)
+      if r then callback(r) else notify("No reading found for: " .. kanji) end
+    else
+      notify("No reading found for: " .. kanji)
+    end
+    return
   end
 
-  local hiragana = parse_jisho_html(result, kanji)
-  if not hiragana then
-    print("No reading found for: " .. kanji)
-    return nil
+  if #readings == 1 then
+    callback(readings[1])
+    return
   end
-  return hiragana
+
+  local mode = M.options.on_multiple_readings
+  if mode == "first" then
+    callback(readings[1])
+  elseif mode == "all" then
+    callback(table.concat(readings, "/"))
+  else
+    vim.ui.select(readings, {
+      prompt = "Reading for " .. kanji .. ":",
+    }, function(choice)
+      if choice then callback(choice) end
+    end)
+  end
 end
+
+-- ---------------------------------------------------------------------------
+-- Insertion helpers
+-- ---------------------------------------------------------------------------
 
 local function enclose_in_parentheses(text)
   return "(" .. text .. ")"
 end
 
 local function get_visual_selection()
-  -- Save the current register 'a' content
   local a_save = vim.fn.getreg('a')
   local a_save_type = vim.fn.getregtype('a')
-
-  -- Yank the visual selection to register 'a'
   vim.cmd('normal! "ay')
-
-  -- Move cursor to end of the visual selection (using `> mark)
   vim.cmd('normal! `>')
-
-  -- Get the yanked text
   local selection = vim.fn.getreg('a')
-
-  -- Restore the original register 'a' content
   vim.fn.setreg('a', a_save, a_save_type)
-
   return selection
+end
+
+-- Insert text after the position of the '> mark in the given buffer. Robust
+-- against the user moving the cursor while vim.ui.select is open. The '> mark
+-- column is the byte offset of the *first* byte of the last selected
+-- character, so we must skip the full UTF-8 codepoint width.
+local function insert_after_mark(bufnr, mark, text)
+  local pos = vim.api.nvim_buf_get_mark(bufnr, mark)
+  local row, col = pos[1], pos[2]
+  if row == 0 then return end
+  local line = vim.api.nvim_buf_get_lines(bufnr, row - 1, row, false)[1] or ""
+  local b = line:byte(col + 1) or 0
+  local char_len = 1
+  if b >= 0xF0 then char_len = 4
+  elseif b >= 0xE0 then char_len = 3
+  elseif b >= 0xC0 then char_len = 2
+  end
+  local insert_col = math.min(col + char_len, #line)
+  vim.api.nvim_buf_set_text(bufnr, row - 1, insert_col, row - 1, insert_col, { text })
 end
 
 local function lookup_and_write_after_visual_selection()
   local selected_text = get_visual_selection()
-  local hiragana = lookup_kanji(selected_text)
-  if hiragana then
-    -- enclosde hiragana in parentheses to visually separate it from the kanji
-    local enclosed_hiragana = enclose_in_parentheses(hiragana)
-    vim.api.nvim_put({ enclosed_hiragana }, "c", true, true)
-  end
+  local bufnr = vim.api.nvim_get_current_buf()
+  lookup_kanji_async(selected_text, function(hiragana)
+    if hiragana then
+      insert_after_mark(bufnr, '>', enclose_in_parentheses(hiragana))
+    end
+  end)
 end
 
 local function lookup_and_write_after_current_word()
   local kanji = vim.fn.expand("<cword>")
-  local hiragana = lookup_kanji(kanji)
-  if hiragana then
-    local enclosed_hiragana = enclose_in_parentheses(hiragana)
-    vim.api.nvim_put({ enclosed_hiragana }, "c", true, true)
-  end
+  local bufnr = vim.api.nvim_get_current_buf()
+  -- Capture position of the end byte of the current word, so insertion still
+  -- lands correctly even if vim.ui.select runs asynchronously.
+  local save_pos = vim.api.nvim_win_get_cursor(0)
+  vim.cmd('normal! e')
+  local end_row, end_col = unpack(vim.api.nvim_win_get_cursor(0))
+  vim.api.nvim_win_set_cursor(0, save_pos)
+
+  lookup_kanji_async(kanji, function(hiragana)
+    if not hiragana then return end
+    local line = vim.api.nvim_buf_get_lines(bufnr, end_row - 1, end_row, false)[1] or ""
+    -- Walk past the multibyte character at end_col to land just after it.
+    local b = line:byte(end_col + 1) or 0
+    local char_len = 1
+    if b >= 0xF0 then char_len = 4
+    elseif b >= 0xE0 then char_len = 3
+    elseif b >= 0xC0 then char_len = 2
+    end
+    local insert_col = math.min(end_col + char_len, #line)
+    vim.api.nvim_buf_set_text(bufnr, end_row - 1, insert_col, end_row - 1, insert_col,
+      { enclose_in_parentheses(hiragana) })
+  end)
 end
+
+-- ---------------------------------------------------------------------------
+-- Setup
+-- ---------------------------------------------------------------------------
 
 M.setup = function(options)
   M.options = vim.tbl_deep_extend("force", default_options, options or {})
+
   vim.keymap.set(
     "x",
     M.options.visual_mode_keymap,
@@ -277,6 +388,14 @@ M.setup = function(options)
     function() lookup_and_write_after_current_word() end,
     vim.tbl_extend("force", M.options.keymap_options, { desc = "Kanji to Hiragana (Normal Mode)" })
   )
+
+  vim.api.nvim_create_user_command("KanjiToHiraganaRebuildIndex", function()
+    M._index = nil
+    pcall(os.remove, M.options.cache_path)
+    if load_index(true) then
+      notify("Index rebuilt.")
+    end
+  end, { desc = "Rebuild the JmdictFurigana lookup index" })
 end
 
 return M
