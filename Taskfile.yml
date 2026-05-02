@@ -1,0 +1,34 @@
+version: '3'
+
+vars:
+  PLENARY_DIR: .deps/plenary.nvim
+
+tasks:
+  deps:
+    desc: Vendor test-time dependencies (plenary.nvim) into .deps/
+    status:
+      - test -d {{.PLENARY_DIR}}
+    cmds:
+      - mkdir -p .deps
+      - git clone --depth 1 https://github.com/nvim-lua/plenary.nvim {{.PLENARY_DIR}}
+
+  test:
+    desc: Run the full test suite
+    deps: [deps]
+    cmds:
+      - >
+        nvim --headless --noplugin -u tests/minimal_init.lua
+        -c "PlenaryBustedDirectory tests/ { minimal_init = 'tests/minimal_init.lua' }"
+
+  test:file:
+    desc: 'Run a single spec file. Usage: task test:file -- tests/foo_spec.lua'
+    deps: [deps]
+    cmds:
+      - >
+        nvim --headless --noplugin -u tests/minimal_init.lua
+        -c "PlenaryBustedFile {{.CLI_ARGS}}"
+
+  clean:
+    desc: Remove vendored test deps
+    cmds:
+      - rm -rf .deps

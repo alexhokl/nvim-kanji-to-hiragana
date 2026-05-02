@@ -4,9 +4,10 @@ local default_options = {
   visual_mode_keymap = "<leader>hi",
   normal_mode_keymap = "<leader>hi",
   keymap_options = { noremap = true, silent = true },
-  -- Path to JmdictFurigana.json (download from
+  -- Path to JmdictFurigana.txt (download from
   -- https://github.com/Doublevil/JmdictFurigana/releases).
-  dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.json",
+  -- Format per line: text|reading|furigana-spec
+  dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.txt",
   -- Path to the precompiled Lua index (auto-generated, mtime-invalidated).
   cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
   -- "select" prompts via vim.ui.select; "first" picks the first reading; "all"
@@ -19,12 +20,31 @@ local default_options = {
 }
 
 -- ---------------------------------------------------------------------------
--- Index loading / building
+-- Notification (overridable for tests)
 -- ---------------------------------------------------------------------------
 
-local function notify(msg, level)
+local notify_fn = function(msg, level)
   vim.notify("[kanji-to-hiragana] " .. msg, level or vim.log.levels.INFO)
 end
+
+local function notify(msg, level)
+  notify_fn(msg, level)
+end
+
+-- Multi-line error reporter that bypasses the cmdline truncation. The message
+-- is appended to :messages history.
+local function report_error(lines)
+  local chunks = {}
+  for i, line in ipairs(lines) do
+    if i > 1 then chunks[#chunks + 1] = { "\n" } end
+    chunks[#chunks + 1] = { "[kanji-to-hiragana] " .. line, "ErrorMsg" }
+  end
+  vim.api.nvim_echo(chunks, true, {})
+end
+
+-- ---------------------------------------------------------------------------
+-- Index loading / building
+-- ---------------------------------------------------------------------------
 
 local function file_mtime(path)
   local stat = vim.loop.fs_stat(path)
@@ -32,42 +52,46 @@ local function file_mtime(path)
   return stat.mtime.sec
 end
 
-local function build_index_from_json(json_path)
-  local f = io.open(json_path, "rb")
-  if not f then
-    notify(
-      "Dictionary not found at " .. json_path ..
-      ". Download JmdictFurigana.json from " ..
-      "https://github.com/Doublevil/JmdictFurigana/releases and place it there.",
-      vim.log.levels.ERROR
-    )
-    return nil
-  end
-  local raw = f:read("*a")
-  f:close()
-
-  local ok, entries = pcall(vim.json.decode, raw)
-  if not ok or type(entries) ~= "table" then
-    notify("Failed to decode " .. json_path .. ": " .. tostring(entries),
-      vim.log.levels.ERROR)
+local function build_index_from_txt(path)
+  if not vim.loop.fs_stat(path) then
+    report_error({
+      "Dictionary not found at " .. path,
+      "Download JmdictFurigana.txt from",
+      "https://github.com/Doublevil/JmdictFurigana/releases",
+      "and place it at the path above (or set dictionary_path in setup()).",
+    })
     return nil
   end
 
   local idx = {}
-  for _, e in ipairs(entries) do
-    local text, reading = e.text, e.reading
-    if type(text) == "string" and type(reading) == "string" and text ~= "" then
-      local list = idx[text]
-      if not list then
-        idx[text] = { reading }
-      else
-        local seen = false
-        for _, r in ipairs(list) do
-          if r == reading then seen = true; break end
+  local ok, err = pcall(function()
+    for raw_line in io.lines(path) do
+      local line = raw_line
+      -- Strip trailing CR if present (CRLF files).
+      if line:sub(-1) == "\r" then line = line:sub(1, -2) end
+      local p1 = line:find("|", 1, true)
+      if p1 then
+        local p2 = line:find("|", p1 + 1, true)
+        local text = line:sub(1, p1 - 1)
+        local reading = p2 and line:sub(p1 + 1, p2 - 1) or line:sub(p1 + 1)
+        if text ~= "" and reading ~= "" then
+          local list = idx[text]
+          if not list then
+            idx[text] = { reading }
+          else
+            local seen = false
+            for _, r in ipairs(list) do
+              if r == reading then seen = true; break end
+            end
+            if not seen then list[#list + 1] = reading end
+          end
         end
-        if not seen then list[#list + 1] = reading end
       end
     end
+  end)
+  if not ok then
+    report_error({ "Failed to read " .. path, tostring(err) })
+    return nil
   end
   return idx
 end
@@ -94,11 +118,11 @@ local function serialize_index(idx, path)
   return true
 end
 
-local function load_cached_index(cache_path, json_path)
+local function load_cached_index(cache_path, source_path)
   local cache_mtime = file_mtime(cache_path)
-  local json_mtime = file_mtime(json_path)
-  if not cache_mtime or not json_mtime then return nil end
-  if cache_mtime < json_mtime then return nil end
+  local source_mtime = file_mtime(source_path)
+  if not cache_mtime or not source_mtime then return nil end
+  if cache_mtime < source_mtime then return nil end
   local chunk, err = loadfile(cache_path)
   if not chunk then
     notify("Cache load failed (" .. tostring(err) .. "); rebuilding.",
@@ -116,19 +140,19 @@ end
 local function load_index(force_rebuild)
   if not force_rebuild and M._index then return M._index end
 
-  local json_path = M.options.dictionary_path
+  local source_path = M.options.dictionary_path
   local cache_path = M.options.cache_path
 
   if not force_rebuild then
-    local cached = load_cached_index(cache_path, json_path)
+    local cached = load_cached_index(cache_path, source_path)
     if cached then
       M._index = cached
       return cached
     end
   end
 
-  notify("Building reading index from JmdictFurigana.json (one-time, ~1s)...")
-  local idx = build_index_from_json(json_path)
+  notify("Building reading index from JmdictFurigana.txt (one-time)...")
+  local idx = build_index_from_txt(source_path)
   if not idx then return nil end
   serialize_index(idx, cache_path)
   M._index = idx
@@ -248,7 +272,8 @@ local function parse_jisho_html(html)
   return hiragana
 end
 
-local function web_lookup_kanji(kanji)
+local web_lookup_kanji
+web_lookup_kanji = function(kanji)
   local encoded = url_encode(kanji)
   local url = M.options.url_template:gsub("{}", (encoded:gsub("%%", "%%%%")))
   local result = vim.fn.system({ "curl", "-s", "-L", url })
@@ -356,7 +381,6 @@ local function lookup_and_write_after_current_word()
   lookup_kanji_async(kanji, function(hiragana)
     if not hiragana then return end
     local line = vim.api.nvim_buf_get_lines(bufnr, end_row - 1, end_row, false)[1] or ""
-    -- Walk past the multibyte character at end_col to land just after it.
     local b = line:byte(end_col + 1) or 0
     local char_len = 1
     if b >= 0xF0 then char_len = 4
@@ -397,5 +421,27 @@ M.setup = function(options)
     end
   end, { desc = "Rebuild the JmdictFurigana lookup index" })
 end
+
+-- ---------------------------------------------------------------------------
+-- Test-only surface (not stable API)
+-- ---------------------------------------------------------------------------
+
+M._defaults_for_test = function()
+  return vim.deepcopy(default_options)
+end
+
+M._internal = {
+  build_index_from_txt = build_index_from_txt,
+  serialize_index = serialize_index,
+  load_cached_index = load_cached_index,
+  load_index = load_index,
+  lookup_kanji_async = lookup_kanji_async,
+  set_notify = function(fn)
+    notify_fn = fn or function() end
+  end,
+  set_web_lookup = function(fn)
+    web_lookup_kanji = fn
+  end,
+}
 
 return M

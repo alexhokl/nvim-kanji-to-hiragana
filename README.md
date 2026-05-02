@@ -7,26 +7,29 @@ A Neovim plugin that inserts the hiragana reading of a Japanese word
 ## Requirements
 
 - Neovim 0.9+
-- A copy of `JmdictFurigana.json` downloaded locally.
+- A copy of `JmdictFurigana.txt` downloaded locally.
 
 ### Download the dictionary
 
-Grab the latest `JmdictFurigana.json` from the
+Grab the latest `JmdictFurigana.txt` from the
 [JmdictFurigana releases](https://github.com/Doublevil/JmdictFurigana/releases)
 and place it where Neovim's data dir lives. The default expected path is:
 
-- Linux / macOS: `~/.local/share/nvim/JmdictFurigana.json`
-- Windows: `~/AppData/Local/nvim-data/JmdictFurigana.json`
+- Linux / macOS: `~/.local/share/nvim/JmdictFurigana.txt`
+- Windows: `~/AppData/Local/nvim-data/JmdictFurigana.txt`
 
 Example:
 
 ```sh
-mkdir -p "$(nvim --headless +'echo stdpath("data")' +q 2>&1)"
-curl -L -o "$HOME/.local/share/nvim/JmdictFurigana.json" \
-  https://github.com/Doublevil/JmdictFurigana/releases/latest/download/JmdictFurigana.json
+curl -L -o "$HOME/.local/share/nvim/JmdictFurigana.txt" \
+  https://github.com/Doublevil/JmdictFurigana/releases/latest/download/JmdictFurigana.txt
 ```
 
 You can override the path via the `dictionary_path` option.
+
+> **Note**: prior versions used `JmdictFurigana.json`; the plugin now uses the
+> line-delimited `.txt` release because it is faster to parse and uses
+> significantly less memory.
 
 ## Installation
 
@@ -58,8 +61,8 @@ require("nvim-kanji-to-hiragana").setup({
   normal_mode_keymap = "<leader>hi",
   keymap_options = { noremap = true, silent = true },
 
-  -- Path to JmdictFurigana.json
-  dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.json",
+  -- Path to JmdictFurigana.txt
+  dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.txt",
 
   -- Precompiled lookup-index cache (auto-managed, mtime-invalidated)
   cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
@@ -76,16 +79,15 @@ require("nvim-kanji-to-hiragana").setup({
 
 ## How it works
 
-On the first lookup of a session, the plugin parses `JmdictFurigana.json`
-(~30 MB) once and writes a precompiled Lua table to `cache_path`. Subsequent
+On first lookup of a session, the plugin streams `JmdictFurigana.txt`
+line-by-line and writes a precompiled Lua table to `cache_path`. Subsequent
 sessions load the cached index in ~150 ms via `loadfile`. The cache is
-invalidated automatically when the JSON file's mtime is newer.
+invalidated automatically when the source file's mtime is newer.
 
 ## Commands
 
 - `:KanjiToHiraganaRebuildIndex` — delete the cache and rebuild the index from
-  the JSON. Run this if you replace `JmdictFurigana.json` with a newer release
-  and the mtime check doesn't pick it up.
+  the source file.
 
 ## Limitations
 
@@ -93,3 +95,17 @@ invalidated automatically when the JSON file's mtime is newer.
   won't match. Selecting the dictionary form (食べる) works.
 - For words missing from the dataset, enable `fallback_to_web = true` to
   continue using the legacy jisho.org scraper.
+
+## Development
+
+Tests use [plenary.nvim](https://github.com/nvim-lua/plenary.nvim)'s busted
+runner and are orchestrated via [Task](https://taskfile.dev):
+
+```sh
+task test               # run the full suite
+task test:file -- tests/nvim-kanji-to-hiragana_spec.lua
+task clean              # remove vendored test deps
+```
+
+The first run vendors plenary into `.deps/plenary.nvim` (gitignored).
+
