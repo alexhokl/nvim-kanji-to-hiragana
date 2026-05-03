@@ -271,3 +271,63 @@ describe("lookup_kanji_async", function()
     assert.is_false(called)
   end)
 end)
+
+describe("download_dictionary", function()
+  before_each(function()
+    reset_options()
+    silence_notify()
+  end)
+
+  it("writes file to dictionary_path and clears the cache on success", function()
+    local dest = vim.fn.tempname()
+    local cache = vim.fn.tempname()
+    h.write_file(cache, "return {}")
+    plugin.options.dictionary_path = dest
+    plugin.options.cache_path = cache
+    plugin._index = { foo = { "bar" } }
+
+    -- Stub vim.system to simulate a successful curl by writing the expected
+    -- temp file ourselves and reporting exit code 0.
+    local restore = h.stub(vim, "system", function(cmd, _opts, on_exit)
+      -- Locate "--output <path>" argument and write a payload there.
+      for i, arg in ipairs(cmd) do
+        if arg == "--output" then
+          local out = cmd[i + 1]
+          local f = assert(io.open(out, "wb"))
+          f:write("食べる|たべる|0:た\n")
+          f:close()
+        end
+      end
+      on_exit({ code = 0, stderr = "" })
+    end)
+
+    local done
+    internal.download_dictionary(function(ok) done = ok end)
+    vim.wait(200, function() return done ~= nil end)
+    restore()
+
+    assert.is_true(done)
+    assert.are.equal("食べる|たべる|0:た\n", h.read_file(dest))
+    assert.is_nil(vim.loop.fs_stat(cache)) -- cache removed
+    assert.is_nil(plugin._index)           -- in-memory index cleared
+    os.remove(dest)
+  end)
+
+  it("reports failure and does not move file when curl exits non-zero", function()
+    local dest = vim.fn.tempname() .. "-missing"
+    plugin.options.dictionary_path = dest
+
+    local restore = h.stub(vim, "system", function(_cmd, _opts, on_exit)
+      on_exit({ code = 22, stderr = "HTTP 404" })
+    end)
+    local echo_restore = h.stub(vim.api, "nvim_echo", function() end)
+
+    local done
+    internal.download_dictionary(function(ok) done = ok end)
+    vim.wait(200, function() return done ~= nil end)
+    restore(); echo_restore()
+
+    assert.is_false(done)
+    assert.is_nil(vim.loop.fs_stat(dest))
+  end)
+end)

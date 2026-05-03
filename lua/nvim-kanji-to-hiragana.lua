@@ -8,6 +8,10 @@ local default_options = {
   -- https://github.com/Doublevil/JmdictFurigana/releases).
   -- Format per line: text|reading|furigana-spec
   dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.txt",
+  -- URL used by :KanjiToHiraganaDownloadDictionary to fetch the latest
+  -- JmdictFurigana.txt release asset.
+  dictionary_url =
+  "https://github.com/Doublevil/JmdictFurigana/releases/latest/download/JmdictFurigana.txt",
   -- Path to the precompiled Lua index (auto-generated, mtime-invalidated).
   cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
   -- "select" prompts via vim.ui.select; "first" picks the first reading; "all"
@@ -394,6 +398,66 @@ local function lookup_and_write_after_current_word()
 end
 
 -- ---------------------------------------------------------------------------
+-- Dictionary download
+-- ---------------------------------------------------------------------------
+
+local function download_dictionary(callback)
+  local url = M.options.dictionary_url
+  local dest = M.options.dictionary_path
+
+  if vim.fn.executable("curl") ~= 1 then
+    report_error({ "curl is required to download the dictionary; not found in $PATH." })
+    if callback then callback(false) end
+    return
+  end
+
+  -- Ensure the destination directory exists.
+  local dir = vim.fn.fnamemodify(dest, ":h")
+  vim.fn.mkdir(dir, "p")
+
+  local tmp = dest .. ".download"
+  notify("Downloading " .. url .. " ...")
+
+  local cmd = { "curl", "--fail", "--location", "--silent", "--show-error",
+    "--output", tmp, url }
+
+  local function on_exit(obj)
+    local code = obj.code or obj
+    if code ~= 0 then
+      pcall(os.remove, tmp)
+      local stderr = (type(obj) == "table" and obj.stderr) or ""
+      report_error({
+        "Failed to download dictionary (curl exit " .. tostring(code) .. ").",
+        stderr ~= "" and stderr or "URL: " .. url,
+      })
+      if callback then callback(false) end
+      return
+    end
+    local ok, err = os.rename(tmp, dest)
+    if not ok then
+      report_error({ "Failed to move downloaded file to " .. dest .. ": " .. tostring(err) })
+      pcall(os.remove, tmp)
+      if callback then callback(false) end
+      return
+    end
+    -- Invalidate caches so the next lookup rebuilds from the fresh source.
+    M._index = nil
+    pcall(os.remove, M.options.cache_path)
+    notify("Dictionary saved to " .. dest)
+    if callback then callback(true) end
+  end
+
+  if vim.system then
+    -- Neovim 0.10+: async, non-blocking.
+    vim.system(cmd, { text = true }, vim.schedule_wrap(on_exit))
+  else
+    -- Fallback for older Neovim: synchronous.
+    local out = vim.fn.system(cmd)
+    on_exit({ code = vim.v.shell_error, stderr = out })
+  end
+end
+
+-- ---------------------------------------------------------------------------
 -- Setup
 -- ---------------------------------------------------------------------------
 
@@ -420,6 +484,10 @@ M.setup = function(options)
       notify("Index rebuilt.")
     end
   end, { desc = "Rebuild the JmdictFurigana lookup index" })
+
+  vim.api.nvim_create_user_command("KanjiToHiraganaDownloadDictionary", function()
+    download_dictionary()
+  end, { desc = "Download the latest JmdictFurigana.txt to dictionary_path" })
 end
 
 -- ---------------------------------------------------------------------------
@@ -436,6 +504,7 @@ M._internal = {
   load_cached_index = load_cached_index,
   load_index = load_index,
   lookup_kanji_async = lookup_kanji_async,
+  download_dictionary = download_dictionary,
   set_notify = function(fn)
     notify_fn = fn or function() end
   end,

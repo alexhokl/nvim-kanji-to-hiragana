@@ -64,6 +64,9 @@ require("nvim-kanji-to-hiragana").setup({
   -- Path to JmdictFurigana.txt
   dictionary_path = vim.fn.stdpath("data") .. "/JmdictFurigana.txt",
 
+  -- URL used by :KanjiToHiraganaDownloadDictionary
+  dictionary_url = "https://github.com/Doublevil/JmdictFurigana/releases/latest/download/JmdictFurigana.txt",
+
   -- Precompiled lookup-index cache (auto-managed, mtime-invalidated)
   cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
 
@@ -86,6 +89,9 @@ invalidated automatically when the source file's mtime is newer.
 
 ## Commands
 
+- `:KanjiToHiraganaDownloadDictionary` — fetch the latest `JmdictFurigana.txt`
+  from `dictionary_url` (default: GitHub releases) into `dictionary_path` and
+  invalidate the cache. Requires `curl` in `$PATH`.
 - `:KanjiToHiraganaRebuildIndex` — delete the cache and rebuild the index from
   the source file.
 
