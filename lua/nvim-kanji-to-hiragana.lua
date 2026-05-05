@@ -3,6 +3,10 @@ local M = {}
 local default_options = {
   visual_mode_keymap = "<leader>hi",
   normal_mode_keymap = "<leader>hi",
+  -- Reverse direction (hiragana -> kanji). Inserts the chosen kanji directly
+  -- before the source hiragana, leaving the original characters in place.
+  visual_mode_keymap_reverse = "<leader>hk",
+  normal_mode_keymap_reverse = "<leader>hk",
   keymap_options = { noremap = true, silent = true },
   -- Path to JmdictFurigana.txt (download from
   -- https://github.com/Doublevil/JmdictFurigana/releases).
@@ -14,11 +18,19 @@ local default_options = {
   "https://github.com/Doublevil/JmdictFurigana/releases/latest/download/JmdictFurigana.txt",
   -- Path to the precompiled Lua index (auto-generated, mtime-invalidated).
   cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
+  -- Path to the precompiled reverse Lua index (reading -> {texts}).
+  reverse_cache_path = vim.fn.stdpath("cache") ..
+      "/nvim-kanji-to-hiragana-reverse-index.lua",
   -- "select" prompts via vim.ui.select; "first" picks the first reading; "all"
   -- joins them with "/".
   on_multiple_readings = "select",
+  -- Same semantics, applied to reverse lookup (reading -> kanji). Reverse
+  -- lookups almost always have many homophones; "select" is the sensible
+  -- default.
+  on_multiple_kanji = "select",
   -- If true, fall back to the legacy jisho.org HTML scraper when the kanji is
-  -- not found in the local dictionary. Requires curl.
+  -- not found in the local dictionary. Requires curl. Reverse lookups never
+  -- consult the web fallback.
   fallback_to_web = false,
   url_template = "https://jisho.org/word/{}",
 }
@@ -160,6 +172,80 @@ local function load_index(force_rebuild)
   if not idx then return nil end
   serialize_index(idx, cache_path)
   M._index = idx
+  return idx
+end
+
+-- ---------------------------------------------------------------------------
+-- Reverse index (reading -> {texts})
+-- ---------------------------------------------------------------------------
+
+local function build_reverse_index_from_txt(path)
+  if not vim.loop.fs_stat(path) then
+    report_error({
+      "Dictionary not found at " .. path,
+      "Download JmdictFurigana.txt from",
+      "https://github.com/Doublevil/JmdictFurigana/releases",
+      "and place it at the path above (or set dictionary_path in setup()).",
+    })
+    return nil
+  end
+
+  local idx = {}
+  local ok, err = pcall(function()
+    for raw_line in io.lines(path) do
+      local line = raw_line
+      if line:sub(-1) == "\r" then line = line:sub(1, -2) end
+      local p1 = line:find("|", 1, true)
+      if p1 then
+        local p2 = line:find("|", p1 + 1, true)
+        local text = line:sub(1, p1 - 1)
+        local reading = p2 and line:sub(p1 + 1, p2 - 1) or line:sub(p1 + 1)
+        if text ~= "" and reading ~= "" then
+          local list = idx[reading]
+          if not list then
+            idx[reading] = { text }
+          else
+            local seen = false
+            for _, t in ipairs(list) do
+              if t == text then seen = true; break end
+            end
+            if not seen then list[#list + 1] = text end
+          end
+        end
+      end
+    end
+  end)
+  if not ok then
+    report_error({ "Failed to read " .. path, tostring(err) })
+    return nil
+  end
+  return idx
+end
+
+local function load_cached_reverse_index(cache_path, source_path)
+  -- Reuse the same staleness rules as the forward cache.
+  return load_cached_index(cache_path, source_path)
+end
+
+local function load_reverse_index(force_rebuild)
+  if not force_rebuild and M._reverse_index then return M._reverse_index end
+
+  local source_path = M.options.dictionary_path
+  local cache_path = M.options.reverse_cache_path
+
+  if not force_rebuild then
+    local cached = load_cached_reverse_index(cache_path, source_path)
+    if cached then
+      M._reverse_index = cached
+      return cached
+    end
+  end
+
+  notify("Building reverse reading index from JmdictFurigana.txt (one-time)...")
+  local idx = build_reverse_index_from_txt(source_path)
+  if not idx then return nil end
+  serialize_index(idx, cache_path)
+  M._reverse_index = idx
   return idx
 end
 
@@ -325,6 +411,34 @@ local function lookup_kanji_async(kanji, callback)
   end
 end
 
+local function lookup_hiragana_async(reading, callback)
+  local idx = load_reverse_index()
+  local matches = idx and idx[reading] or nil
+
+  if not matches or #matches == 0 then
+    notify("No kanji found for: " .. reading)
+    return
+  end
+
+  if #matches == 1 then
+    callback(matches[1])
+    return
+  end
+
+  local mode = M.options.on_multiple_kanji
+  if mode == "first" then
+    callback(matches[1])
+  elseif mode == "all" then
+    callback(table.concat(matches, "/"))
+  else
+    vim.ui.select(matches, {
+      prompt = "Kanji for " .. reading .. ":",
+    }, function(choice)
+      if choice then callback(choice) end
+    end)
+  end
+end
+
 -- ---------------------------------------------------------------------------
 -- Insertion helpers
 -- ---------------------------------------------------------------------------
@@ -397,6 +511,47 @@ local function lookup_and_write_after_current_word()
   end)
 end
 
+-- Insert text at the position of the given mark (i.e. immediately *before*
+-- the marked byte). Used by the reverse mapping to prepend kanji directly in
+-- front of the source hiragana.
+local function insert_at_mark(bufnr, mark, text)
+  local pos = vim.api.nvim_buf_get_mark(bufnr, mark)
+  local row, col = pos[1], pos[2]
+  if row == 0 then return end
+  vim.api.nvim_buf_set_text(bufnr, row - 1, col, row - 1, col, { text })
+end
+
+local function lookup_and_write_before_visual_selection_kanji()
+  local selected_text = get_visual_selection()
+  local bufnr = vim.api.nvim_get_current_buf()
+  lookup_hiragana_async(selected_text, function(kanji)
+    if kanji then
+      insert_at_mark(bufnr, '<', kanji)
+    end
+  end)
+end
+
+local function lookup_and_write_before_current_word_kanji()
+  local reading = vim.fn.expand("<cword>")
+  local bufnr = vim.api.nvim_get_current_buf()
+  -- Capture the position of the *first* byte of the current word so we can
+  -- prepend the chosen kanji even after vim.ui.select returns asynchronously.
+  local save_pos = vim.api.nvim_win_get_cursor(0)
+  vim.cmd('normal! b')
+  local start_row, start_col = unpack(vim.api.nvim_win_get_cursor(0))
+  -- If the cursor was already mid-word on a non-keyword boundary, `b` may
+  -- have moved to the previous word. In practice <cword> + `b` lands at the
+  -- first byte of <cword> for typical hiragana sequences, but we restore the
+  -- original position regardless.
+  vim.api.nvim_win_set_cursor(0, save_pos)
+
+  lookup_hiragana_async(reading, function(kanji)
+    if not kanji then return end
+    vim.api.nvim_buf_set_text(bufnr, start_row - 1, start_col,
+      start_row - 1, start_col, { kanji })
+  end)
+end
+
 -- ---------------------------------------------------------------------------
 -- Dictionary download
 -- ---------------------------------------------------------------------------
@@ -442,7 +597,9 @@ local function download_dictionary(callback)
     end
     -- Invalidate caches so the next lookup rebuilds from the fresh source.
     M._index = nil
+    M._reverse_index = nil
     pcall(os.remove, M.options.cache_path)
+    pcall(os.remove, M.options.reverse_cache_path)
     notify("Dictionary saved to " .. dest)
     if callback then callback(true) end
   end
@@ -477,9 +634,24 @@ M.setup = function(options)
     vim.tbl_extend("force", M.options.keymap_options, { desc = "Kanji to Hiragana (Normal Mode)" })
   )
 
+  vim.keymap.set(
+    "x",
+    M.options.visual_mode_keymap_reverse,
+    function() lookup_and_write_before_visual_selection_kanji() end,
+    vim.tbl_extend("force", M.options.keymap_options, { desc = "Hiragana to Kanji (Visual Mode)" })
+  )
+  vim.keymap.set(
+    "n",
+    M.options.normal_mode_keymap_reverse,
+    function() lookup_and_write_before_current_word_kanji() end,
+    vim.tbl_extend("force", M.options.keymap_options, { desc = "Hiragana to Kanji (Normal Mode)" })
+  )
+
   vim.api.nvim_create_user_command("KanjiToHiraganaRebuildIndex", function()
     M._index = nil
+    M._reverse_index = nil
     pcall(os.remove, M.options.cache_path)
+    pcall(os.remove, M.options.reverse_cache_path)
     if load_index(true) then
       notify("Index rebuilt.")
     end
@@ -503,7 +675,10 @@ M._internal = {
   serialize_index = serialize_index,
   load_cached_index = load_cached_index,
   load_index = load_index,
+  build_reverse_index_from_txt = build_reverse_index_from_txt,
+  load_reverse_index = load_reverse_index,
   lookup_kanji_async = lookup_kanji_async,
+  lookup_hiragana_async = lookup_hiragana_async,
   download_dictionary = download_dictionary,
   set_notify = function(fn)
     notify_fn = fn or function() end

@@ -1,7 +1,13 @@
 # nvim-kanji-to-hiragana
 
-A Neovim plugin that inserts the hiragana reading of a Japanese word
-(kanji/compound) right after it. Lookups are performed **offline** against the
+A Neovim plugin for bidirectional Japanese reading conversion:
+
+- **Kanji → Hiragana**: inserts the hiragana reading of a Japanese word
+  (kanji/compound) right after it, in parentheses.
+- **Hiragana → Kanji**: prepends the chosen kanji form directly before a
+  hiragana word, leaving the source hiragana in place.
+
+Both directions look up offline against the
 [JmdictFurigana](https://github.com/Doublevil/JmdictFurigana) dataset.
 
 ## Requirements
@@ -46,6 +52,8 @@ Using `lazy.nvim`:
 
 ## Usage
 
+### Kanji → Hiragana (`<leader>hi`)
+
 - **Normal mode**: place the cursor on a Japanese word and press `<leader>hi`.
   The plugin inserts ` (よみ)` after the word.
 - **Visual mode**: select a Japanese phrase and press `<leader>hi`.
@@ -53,12 +61,24 @@ Using `lazy.nvim`:
 If the word has multiple readings (e.g. 今日 → きょう / こんにち), a picker
 appears via `vim.ui.select` — choose the desired reading.
 
+### Hiragana → Kanji (`<leader>hk`)
+
+- **Normal mode**: place the cursor on a hiragana word and press `<leader>hk`.
+  The plugin prepends the chosen kanji directly in front of the word
+  (e.g. `たべる` → `食べるたべる`).
+- **Visual mode**: select a hiragana span and press `<leader>hk`.
+
+Most readings have many homophone kanji, so a `vim.ui.select` picker is shown
+by default; configure via `on_multiple_kanji`.
+
 ## Configuration
 
 ```lua
 require("nvim-kanji-to-hiragana").setup({
   visual_mode_keymap = "<leader>hi",
   normal_mode_keymap = "<leader>hi",
+  visual_mode_keymap_reverse = "<leader>hk",
+  normal_mode_keymap_reverse = "<leader>hk",
   keymap_options = { noremap = true, silent = true },
 
   -- Path to JmdictFurigana.txt
@@ -67,14 +87,17 @@ require("nvim-kanji-to-hiragana").setup({
   -- URL used by :KanjiToHiraganaDownloadDictionary
   dictionary_url = "https://github.com/Doublevil/JmdictFurigana/releases/latest/download/JmdictFurigana.txt",
 
-  -- Precompiled lookup-index cache (auto-managed, mtime-invalidated)
+  -- Precompiled lookup-index caches (auto-managed, mtime-invalidated)
   cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-index.lua",
+  reverse_cache_path = vim.fn.stdpath("cache") .. "/nvim-kanji-to-hiragana-reverse-index.lua",
 
   -- "select" | "first" | "all"
   on_multiple_readings = "select",
+  on_multiple_kanji = "select",
 
   -- If true, fall back to https://jisho.org HTML scraping when a word is
-  -- absent from the local dictionary. Requires curl.
+  -- absent from the local dictionary. Forward (kanji -> hiragana) only;
+  -- reverse lookups never consult the web.
   fallback_to_web = false,
   url_template = "https://jisho.org/word/{}",
 })
@@ -91,9 +114,10 @@ invalidated automatically when the source file's mtime is newer.
 
 - `:KanjiToHiraganaDownloadDictionary` — fetch the latest `JmdictFurigana.txt`
   from `dictionary_url` (default: GitHub releases) into `dictionary_path` and
-  invalidate the cache. Requires `curl` in `$PATH`.
-- `:KanjiToHiraganaRebuildIndex` — delete the cache and rebuild the index from
-  the source file.
+  invalidate both caches. Requires `curl` in `$PATH`.
+- `:KanjiToHiraganaRebuildIndex` — delete the forward and reverse caches and
+  rebuild the forward index from the source file. The reverse index is then
+  rebuilt lazily on first hiragana → kanji lookup.
 
 ## Limitations
 
