@@ -489,24 +489,36 @@ end
 local function lookup_and_write_after_current_word()
   local kanji = vim.fn.expand("<cword>")
   local bufnr = vim.api.nvim_get_current_buf()
-  -- Capture position of the end byte of the current word, so insertion still
-  -- lands correctly even if vim.ui.select runs asynchronously.
-  local save_pos = vim.api.nvim_win_get_cursor(0)
-  vim.cmd('normal! e')
-  local end_row, end_col = unpack(vim.api.nvim_win_get_cursor(0))
-  vim.api.nvim_win_set_cursor(0, save_pos)
+  -- Compute the insertion point without cursor motion to avoid the `normal! e`
+  -- overshoot: when <cword> is a single character already at a word-end, `e`
+  -- jumps forward to the *next* word-end, placing the hiragana at the wrong
+  -- position (e.g. end of line instead of right after the kanji).
+  --
+  -- Strategy: use searchpos with flags 'bcn' (backward from cursor, accept
+  -- match at cursor position, don't move cursor) to locate the byte column of
+  -- the first byte of <cword>, then advance by #kanji bytes to land immediately
+  -- after the last byte of the word. This is stable across an async
+  -- vim.ui.select call because the position is captured before the call.
+  local insert_row = vim.api.nvim_win_get_cursor(0)[1]
+  -- searchpos returns {row, col} 1-indexed; col 0 means not found.
+  local found = vim.fn.searchpos("\\V\\<" .. vim.fn.escape(kanji, "\\"), "bcn")
+  local word_start_col
+  if found[1] > 0 then
+    word_start_col = found[2] - 1  -- convert to 0-indexed byte column
+  else
+    -- Fallback: use current cursor column (handles edge cases where the word
+    -- boundary pattern doesn't match, e.g. non-keyword context).
+    word_start_col = vim.api.nvim_win_get_cursor(0)[2]
+  end
+  -- Byte offset immediately after the last byte of <cword>; #kanji counts all
+  -- bytes in the word string so no per-character UTF-8 width math is needed.
+  local insert_col_pre = word_start_col + #kanji
 
   lookup_kanji_async(kanji, function(hiragana)
     if not hiragana then return end
-    local line = vim.api.nvim_buf_get_lines(bufnr, end_row - 1, end_row, false)[1] or ""
-    local b = line:byte(end_col + 1) or 0
-    local char_len = 1
-    if b >= 0xF0 then char_len = 4
-    elseif b >= 0xE0 then char_len = 3
-    elseif b >= 0xC0 then char_len = 2
-    end
-    local insert_col = math.min(end_col + char_len, #line)
-    vim.api.nvim_buf_set_text(bufnr, end_row - 1, insert_col, end_row - 1, insert_col,
+    local line = vim.api.nvim_buf_get_lines(bufnr, insert_row - 1, insert_row, false)[1] or ""
+    local insert_col = math.min(insert_col_pre, #line)
+    vim.api.nvim_buf_set_text(bufnr, insert_row - 1, insert_col, insert_row - 1, insert_col,
       { enclose_in_parentheses(hiragana) })
   end)
 end

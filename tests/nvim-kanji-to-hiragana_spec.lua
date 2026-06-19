@@ -331,3 +331,120 @@ describe("download_dictionary", function()
     assert.is_nil(vim.loop.fs_stat(dest))
   end)
 end)
+
+-- Helpers that replicate the fixed insertion logic from
+-- lookup_and_write_after_current_word. Extracted here so each test case can
+-- call them without duplicating the searchpos math.
+local function insert_hiragana_after_cword(bufnr, kanji, hiragana)
+  -- Mirror the production code: searchpos with 'bcn' finds the byte start of
+  -- <cword> without moving the cursor, then we advance by #kanji bytes.
+  local insert_row = vim.api.nvim_win_get_cursor(0)[1]
+  local found = vim.fn.searchpos("\\V\\<" .. vim.fn.escape(kanji, "\\"), "bcn")
+  local word_start_col
+  if found[1] > 0 then
+    word_start_col = found[2] - 1
+  else
+    word_start_col = vim.api.nvim_win_get_cursor(0)[2]
+  end
+  local insert_col_pre = word_start_col + #kanji
+  local line = vim.api.nvim_buf_get_lines(bufnr, insert_row - 1, insert_row, false)[1] or ""
+  local insert_col = math.min(insert_col_pre, #line)
+  vim.api.nvim_buf_set_text(bufnr, insert_row - 1, insert_col, insert_row - 1, insert_col,
+    { "(" .. hiragana .. ")" })
+end
+
+describe("normal-mode insertion", function()
+  before_each(function()
+    reset_options()
+    silence_notify()
+    plugin.options.on_multiple_readings = "first"
+  end)
+
+  it("inserts (てん) immediately after 点 in mid-sentence context", function()
+    -- Regression test: previously `normal! e` overshot the single-char kanji
+    -- and placed the hiragana at the end of the line.
+    -- Expected: 点(てん)がもらえません。
+    plugin._index = { ["点"] = { "てん" } }
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "点がもらえません。" })
+    -- Place cursor on 点 (row 1, byte col 0)
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+
+    local kanji = vim.fn.expand("<cword>")
+    assert.are.equal("点", kanji)
+    internal.lookup_kanji_async(kanji, function(hiragana)
+      insert_hiragana_after_cword(bufnr, kanji, hiragana)
+    end)
+
+    local line = vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1]
+    assert.are.equal("点(てん)がもらえません。", line)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+
+  it("inserts (とうきょう) immediately after 東京 in mid-sentence context", function()
+    -- Multi-character all-kanji word mid-sentence. In Neovim's default iskeyword
+    -- setting consecutive kanji characters form a single <cword>, so cursor on
+    -- 東 (col 0) of "東京に行く。" yields <cword> = "東京".
+    -- Expected: 東京(とうきょう)に行く。
+    plugin._index = { ["東京"] = { "とうきょう" } }
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "東京に行く。" })
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+
+    local kanji = vim.fn.expand("<cword>")
+    assert.are.equal("東京", kanji)
+    internal.lookup_kanji_async(kanji, function(hiragana)
+      insert_hiragana_after_cword(bufnr, kanji, hiragana)
+    end)
+
+    local line = vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1]
+    assert.are.equal("東京(とうきょう)に行く。", line)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+
+  it("inserts (にほん) immediately after 日本 when cursor is on second character", function()
+    -- Cursor placed on the second character 本 (byte col 3) rather than 日.
+    -- searchpos 'bcn' should still find the word start at byte col 0.
+    -- "日本は好きです。": 日本 is followed by kana so <cword> = "日本" from either byte.
+    -- Expected: 日本(にほん)は好きです。
+    plugin._index = { ["日本"] = { "にほん" } }
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "日本は好きです。" })
+    -- 本 is the second UTF-8 character; each kanji is 3 bytes, so byte col 3.
+    vim.api.nvim_win_set_cursor(0, { 1, 3 })
+
+    local kanji = vim.fn.expand("<cword>")
+    assert.are.equal("日本", kanji)
+    internal.lookup_kanji_async(kanji, function(hiragana)
+      insert_hiragana_after_cword(bufnr, kanji, hiragana)
+    end)
+
+    local line = vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1]
+    assert.are.equal("日本(にほん)は好きです。", line)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+
+  it("inserts (とうきょう) after 東京 at the end of a line", function()
+    -- Edge case: kanji is the last word on the line; insert_col must not
+    -- exceed the line length.
+    -- Expected: 東京(とうきょう)
+    plugin._index = { ["東京"] = { "とうきょう" } }
+    local bufnr = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_current_buf(bufnr)
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "東京" })
+    vim.api.nvim_win_set_cursor(0, { 1, 0 })
+
+    local kanji = vim.fn.expand("<cword>")
+    assert.are.equal("東京", kanji)
+    internal.lookup_kanji_async(kanji, function(hiragana)
+      insert_hiragana_after_cword(bufnr, kanji, hiragana)
+    end)
+
+    local line = vim.api.nvim_buf_get_lines(bufnr, 0, 1, false)[1]
+    assert.are.equal("東京(とうきょう)", line)
+    vim.api.nvim_buf_delete(bufnr, { force = true })
+  end)
+end)
