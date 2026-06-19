@@ -375,6 +375,430 @@ web_lookup_kanji = function(kanji)
 end
 
 -- ---------------------------------------------------------------------------
+-- Verb deinflection
+-- ---------------------------------------------------------------------------
+
+-- Returns an ordered list of candidate dictionary-form strings for `word`.
+-- Candidates are over-generated intentionally; callers filter by index lookup.
+-- The list is ordered most-specific first so longer suffix matches win.
+--
+-- Strategy:
+--   1. Hard-coded irregular verb forms (する/くる and their kanji compounds).
+--   2. Ichidan (る-verb) endings: strip the ending and append る.
+--   3. Godan (う-verb) endings: reverse the standard conjugation vowel shift.
+--
+-- Only the kana suffix is examined; the kanji stem is kept unchanged.
+-- All kana comparisons are in UTF-8 byte strings (Lua 5.4 default).
+
+-- utf8_len: number of UTF-8 codepoints in s (used to guard minimum stem length)
+local function utf8_len(s)
+  local n = 0
+  local i = 1
+  while i <= #s do
+    local b = s:byte(i)
+    if b >= 0xF0 then i = i + 4
+    elseif b >= 0xE0 then i = i + 3
+    elseif b >= 0xC0 then i = i + 2
+    else i = i + 1
+    end
+    n = n + 1
+  end
+  return n
+end
+
+-- utf8_sub: return the last `n` UTF-8 codepoints of s as a byte string.
+-- Also returns the byte index of the split point so the stem can be extracted.
+local function utf8_last_bytes(s, n)
+  -- Walk from the end: collect codepoint start positions from the back.
+  local positions = {}
+  local i = #s
+  while i >= 1 do
+    local b = s:byte(i)
+    if b < 0x80 or b >= 0xC0 then
+      -- This byte is a codepoint start (ASCII or leading byte of multibyte).
+      table.insert(positions, 1, i)
+      if #positions == n then break end
+    end
+    i = i - 1
+  end
+  if #positions == 0 then return "", #s + 1 end
+  local split = positions[1]
+  return s:sub(split), split
+end
+
+-- Deinflection rule table.
+-- Each entry: { suffix_bytes, replacement_bytes, min_stem_codepoints }
+-- suffix_bytes   : kana suffix to strip (UTF-8 string)
+-- replacement    : kana to append after stripping (UTF-8 string, may be "")
+-- min_stem_cp    : minimum codepoints required in the remaining stem
+--
+-- Rules are tried in order; first matching rule whose stripped stem has at
+-- least min_stem_cp codepoints produces a candidate.  Multiple rules may
+-- fire for the same input — all candidates are returned.
+local DEINFLECT_RULES = {
+  -- -------------------------------------------------------------------------
+  -- Irregular: する and compound verbs ending in する (〜する)
+  -- -------------------------------------------------------------------------
+  -- These are matched as whole-word replacements handled separately below.
+
+  -- -------------------------------------------------------------------------
+  -- Long suffixes first (most specific)
+  -- -------------------------------------------------------------------------
+
+  -- Causative-passive: 〜させられ(る) ← す-verb causative passive
+  { "させられる", "す", 1 },
+  { "させられた", "す", 1 },
+  { "させられて", "す", 1 },
+  { "させられない", "す", 1 },
+  -- Causative: 〜させ(る)
+  { "させる", "す", 1 },
+  { "させた", "す", 1 },
+  { "させて", "す", 1 },
+  { "させない", "す", 1 },
+
+  -- Ichidan causative-passive: 〜させられ ← 〜る (stem + させられ)
+  { "させられる", "る", 1 },
+  { "させられた", "る", 1 },
+  { "させられて", "る", 1 },
+  { "させられない", "る", 1 },
+  -- Ichidan causative: 〜させる
+  { "させる", "る", 1 },
+  { "させた", "る", 1 },
+  { "させて", "る", 1 },
+
+  -- Passive / potential Ichidan: stem + られ
+  { "られる", "る", 1 },
+  { "られた", "る", 1 },
+  { "られて", "る", 1 },
+  { "られない", "る", 1 },
+  { "られれば", "る", 1 },
+
+  -- Polite negative past: 〜ませんでした
+  { "ませんでした", "る", 1 },  -- Ichidan
+  -- Polite negative: 〜ません
+  { "ません", "る", 1 },        -- Ichidan
+  -- Polite past: 〜ました
+  { "ました", "る", 1 },        -- Ichidan
+  -- Polite: 〜ます (Ichidan: strip nothing from stem, add る)
+  -- The masu-stem of Ichidan is the bare stem, so 食べます → 食べ + ます → 食べる
+  { "ます", "る", 1 },
+
+  -- te-iru / te-iru contracted forms (progressive)
+  { "ている", "る", 1 },
+  { "ていた", "る", 1 },
+  { "ていて", "る", 1 },
+  { "ていない", "る", 1 },
+  { "ている", "る", 1 },  -- same as above, shorthand
+  -- contracted: 〜てる / 〜てた
+  { "てる", "る", 1 },
+  { "てた", "る", 1 },
+
+  -- Negative past: 〜なかった (Ichidan)
+  { "なかった", "る", 1 },
+  -- Negative: 〜ない (Ichidan)
+  { "ない", "る", 1 },
+  -- Negative adverbial: 〜なく (Ichidan)
+  { "なく", "る", 1 },
+
+  -- Conditional: 〜れば (Ichidan)
+  { "れば", "る", 1 },
+  -- Potential Ichidan: 〜られる (already above)
+
+  -- Past / ta-form Ichidan: 〜た
+  { "た", "る", 1 },
+  -- Te-form Ichidan: 〜て
+  { "て", "る", 1 },
+  -- Volitional Ichidan: 〜よう
+  { "よう", "る", 1 },
+  -- Imperative Ichidan: 〜ろ / 〜よ
+  { "ろ", "る", 1 },
+  { "よ", "る", 1 },
+
+  -- -------------------------------------------------------------------------
+  -- Godan (う-verb) conjugation reversal
+  -- Each godan column ends in a different vowel row:
+  --   dict  | a-row | i-row | te/ta | e-row
+  --   く    | か    | き    | いて  | け
+  --   ぐ    | が    | ぎ    | いで  | げ
+  --   す    | さ    | し    | して  | せ
+  --   つ    | た    | ち    | って  | て
+  --   ぬ    | な    | に    | んで  | ね
+  --   ぶ    | ば    | び    | んで  | べ
+  --   む    | ま    | み    | んで  | め
+  --   る    | ら    | り    | って  | れ
+  --   う    | わ    | い    | って  | え
+  -- -------------------------------------------------------------------------
+
+  -- Godan polite negative past
+  { "きませんでした", "く", 1 },
+  { "ぎませんでした", "ぐ", 1 },
+  { "しませんでした", "す", 1 },
+  { "ちませんでした", "つ", 1 },
+  { "にませんでした", "ぬ", 1 },
+  { "びませんでした", "ぶ", 1 },
+  { "みませんでした", "む", 1 },
+  { "りませんでした", "る", 1 },
+  { "いませんでした", "う", 1 },
+
+  -- Godan polite negative: 〜ません
+  { "きません", "く", 1 },
+  { "ぎません", "ぐ", 1 },
+  { "しません", "す", 1 },
+  { "ちません", "つ", 1 },
+  { "にません", "ぬ", 1 },
+  { "びません", "ぶ", 1 },
+  { "みません", "む", 1 },
+  { "りません", "る", 1 },
+  { "いません", "う", 1 },
+
+  -- Godan polite past: 〜ました
+  { "きました", "く", 1 },
+  { "ぎました", "ぐ", 1 },
+  { "しました", "す", 1 },
+  { "ちました", "つ", 1 },
+  { "にました", "ぬ", 1 },
+  { "びました", "ぶ", 1 },
+  { "みました", "む", 1 },
+  { "りました", "る", 1 },
+  { "いました", "う", 1 },
+
+  -- Godan polite: 〜ます
+  { "きます", "く", 1 },
+  { "ぎます", "ぐ", 1 },
+  { "します", "す", 1 },
+  { "ちます", "つ", 1 },
+  { "にます", "ぬ", 1 },
+  { "びます", "ぶ", 1 },
+  { "みます", "む", 1 },
+  { "ります", "る", 1 },
+  { "います", "う", 1 },
+
+  -- Godan negative past: 〜なかった
+  { "かなかった", "く", 1 },
+  { "がなかった", "ぐ", 1 },
+  { "さなかった", "す", 1 },
+  { "たなかった", "つ", 1 },
+  { "ななかった", "ぬ", 1 },
+  { "ばなかった", "ぶ", 1 },
+  { "まなかった", "む", 1 },
+  { "らなかった", "る", 1 },
+  { "わなかった", "う", 1 },
+
+  -- Godan negative: 〜ない
+  { "かない", "く", 1 },
+  { "がない", "ぐ", 1 },
+  { "さない", "す", 1 },
+  { "たない", "つ", 1 },
+  { "なない", "ぬ", 1 },
+  { "ばない", "ぶ", 1 },
+  { "まない", "む", 1 },
+  { "らない", "る", 1 },
+  { "わない", "う", 1 },
+
+  -- Godan te-iru (progressive): 〜いている
+  { "いている", "く", 1 },
+  { "いでいる", "ぐ", 1 },
+  { "していている", "す", 1 },  -- rare but handled
+  { "っている", "つ", 1 },
+  { "んでいる", "ぬ", 1 },
+  { "んでいる", "ぶ", 1 },
+  { "んでいる", "む", 1 },
+  { "っている", "る", 1 },
+  { "っている", "う", 1 },
+
+  -- Godan te-form + た/て (past/te)
+  -- く → いた / いて
+  { "いた", "く", 1 },
+  { "いて", "く", 1 },
+  -- ぐ → いだ / いで
+  { "いだ", "ぐ", 1 },
+  { "いで", "ぐ", 1 },
+  -- す → した / して
+  { "した", "す", 1 },
+  { "して", "す", 1 },
+  -- つ → った / って
+  { "った", "つ", 1 },
+  { "って", "つ", 1 },
+  -- ぬ → んだ / んで
+  { "んだ", "ぬ", 1 },
+  { "んで", "ぬ", 1 },
+  -- ぶ → んだ / んで
+  { "んだ", "ぶ", 1 },
+  { "んで", "ぶ", 1 },
+  -- む → んだ / んで
+  { "んだ", "む", 1 },
+  { "んで", "む", 1 },
+  -- る → った / って  (Godan る)
+  { "った", "る", 1 },
+  { "って", "る", 1 },
+  -- う → った / って
+  { "った", "う", 1 },
+  { "って", "う", 1 },
+
+  -- Godan conditional: 〜eba row (e-row + ば)
+  { "けば", "く", 1 },
+  { "げば", "ぐ", 1 },
+  { "せば", "す", 1 },
+  { "てば", "つ", 1 },
+  { "ねば", "ぬ", 1 },
+  { "べば", "ぶ", 1 },
+  { "めば", "む", 1 },
+  { "れば", "る", 1 },
+  { "えば", "う", 1 },
+
+  -- Godan potential: e-row + る
+  { "ける", "く", 1 },
+  { "げる", "ぐ", 1 },
+  { "せる", "す", 1 },
+  { "てる", "つ", 1 },
+  { "ねる", "ぬ", 1 },
+  { "べる", "ぶ", 1 },
+  { "める", "む", 1 },
+  { "れる", "る", 1 },
+  { "える", "う", 1 },
+
+  -- Godan passive: a-row + れる
+  { "かれる", "く", 1 },
+  { "がれる", "ぐ", 1 },
+  { "される", "す", 1 },
+  { "たれる", "つ", 1 },
+  { "なれる", "ぬ", 1 },
+  { "ばれる", "ぶ", 1 },
+  { "まれる", "む", 1 },
+  { "られる", "る", 1 },
+  { "われる", "う", 1 },
+
+  -- Godan causative: a-row + せる/させる
+  { "かせる", "く", 1 },
+  { "がせる", "ぐ", 1 },
+  { "させる", "す", 1 },
+  { "たせる", "つ", 1 },
+  { "なせる", "ぬ", 1 },
+  { "ばせる", "ぶ", 1 },
+  { "ませる", "む", 1 },
+  { "らせる", "る", 1 },
+  { "わせる", "う", 1 },
+
+  -- Godan volitional: o-row + う
+  { "こう", "く", 1 },
+  { "ごう", "ぐ", 1 },
+  { "そう", "す", 1 },
+  { "とう", "つ", 1 },
+  { "のう", "ぬ", 1 },
+  { "ぼう", "ぶ", 1 },
+  { "もう", "む", 1 },
+  { "ろう", "る", 1 },
+  { "おう", "う", 1 },
+
+  -- Godan imperative: e-row bare
+  { "け", "く", 1 },
+  { "げ", "ぐ", 1 },
+  { "せ", "す", 1 },
+  { "て", "つ", 1 },
+  { "ね", "ぬ", 1 },
+  { "べ", "ぶ", 1 },
+  { "め", "む", 1 },
+  { "れ", "る", 1 },
+  { "え", "う", 1 },
+
+  -- Godan masu-stem (i-row): used in compounds but also standalone misses
+  { "き", "く", 1 },
+  { "ぎ", "ぐ", 1 },
+  { "し", "す", 1 },
+  { "ち", "つ", 1 },
+  { "に", "ぬ", 1 },
+  { "び", "ぶ", 1 },
+  { "み", "む", 1 },
+  { "り", "る", 1 },
+  { "い", "う", 1 },
+}
+
+-- Irregular verb hard-coded mappings.
+-- Key: conjugated kana suffix that appears at the END of the full word.
+-- Value: { stem_kana_suffix_to_strip, replacement } where the FULL word's
+-- kana tail is replaced.  Simpler: we list full kana-tail patterns.
+-- For compound する verbs (愛する, 勉強する) we handle the する/する tail specially.
+local IRREGULAR_RULES = {
+  -- くる (来る) forms
+  { "きた",     "くる" },
+  { "きて",     "くる" },
+  { "きない",   "くる" },
+  { "きません", "くる" },
+  { "きます",   "くる" },
+  { "こない",   "くる" },
+  { "こよう",   "くる" },
+  { "こられる", "くる" },
+  { "こい",     "くる" },
+  { "くれば",   "くる" },
+  { "きた",     "くる" },
+  -- する forms
+  { "した",     "する" },
+  { "して",     "する" },
+  { "しない",   "する" },
+  { "しません", "する" },
+  { "しました", "する" },
+  { "します",   "する" },
+  { "しよう",   "する" },
+  { "される",   "する" },
+  { "させる",   "する" },
+  { "すれば",   "する" },
+  { "しろ",     "する" },
+  { "せよ",     "する" },
+  { "できる",   "する" },  -- potential of する (informal)
+}
+
+local function deinflect(word)
+  if not word or #word == 0 then return {} end
+
+  local seen = {}
+  local candidates = {}
+
+  local function add(c)
+    if not seen[c] and c ~= word then
+      seen[c] = true
+      candidates[#candidates + 1] = c
+    end
+  end
+
+  -- 1. Irregular rules: match kana tail of `word`.
+  for _, rule in ipairs(IRREGULAR_RULES) do
+    local conj_tail, dict_tail = rule[1], rule[2]
+    -- Check if `word` ends with conj_tail (byte suffix match).
+    if #word >= #conj_tail and word:sub(- #conj_tail) == conj_tail then
+      local stem = word:sub(1, #word - #conj_tail)
+      -- For plain する/くる (no kanji stem), the stem is empty and we just
+      -- return the dict_tail itself.
+      if stem == "" then
+        add(dict_tail)
+      else
+        add(stem .. dict_tail)
+      end
+    end
+  end
+
+  -- 2. Compound する verbs: if word ends in する conjugations, try 〜する.
+  -- Already handled above for する itself; here handle 〜する where the word
+  -- has a kanji/kana stem before する.
+  -- e.g. 勉強した → check 勉強 + する path via "した" → "する" above.
+  -- Already covered; no extra work needed.
+
+  -- 3. General rules: strip suffix, append replacement.
+  for _, rule in ipairs(DEINFLECT_RULES) do
+    local suffix, repl, min_cp = rule[1], rule[2], rule[3]
+    local suf_len = #suffix
+    if #word > suf_len and word:sub(-suf_len) == suffix then
+      local stem = word:sub(1, #word - suf_len)
+      -- Ensure the stem has at least min_cp codepoints.
+      if utf8_len(stem) >= min_cp then
+        add(stem .. repl)
+      end
+    end
+  end
+
+  return candidates
+end
+
+-- ---------------------------------------------------------------------------
 -- Lookup (async-aware due to vim.ui.select)
 -- ---------------------------------------------------------------------------
 
@@ -383,6 +807,18 @@ local function lookup_kanji_async(kanji, callback)
   local readings = idx and idx[kanji] or nil
 
   if not readings or #readings == 0 then
+    -- Before giving up, attempt verb deinflection: generate candidate
+    -- dictionary forms and look each one up in the index.
+    local candidates = deinflect(kanji)
+    for _, dict_form in ipairs(candidates) do
+      local alt = idx and idx[dict_form] or nil
+      if alt and #alt > 0 then
+        -- Delegate to the same function so on_multiple_readings logic is reused.
+        lookup_kanji_async(dict_form, callback)
+        return
+      end
+    end
+
     if M.options.fallback_to_web then
       local r = web_lookup_kanji(kanji)
       if r then callback(r) else notify("No reading found for: " .. kanji) end
@@ -692,6 +1128,7 @@ M._internal = {
   lookup_kanji_async = lookup_kanji_async,
   lookup_hiragana_async = lookup_hiragana_async,
   download_dictionary = download_dictionary,
+  deinflect = deinflect,
   set_notify = function(fn)
     notify_fn = fn or function() end
   end,
