@@ -110,6 +110,12 @@ line-by-line and writes a precompiled Lua table to `cache_path`. Subsequent
 sessions load the cached index in ~150 ms via `loadfile`. The cache is
 invalidated automatically when the source file's mtime is newer.
 
+When the input word is not found directly in the index, the plugin attempts
+verb deinflection: it generates candidate dictionary forms covering Ichidan
+(る-verb), Godan (all nine columns), irregular する/くる, and compound する
+verbs, then retries the index lookup for each candidate. The first hit wins.
+The web fallback (if enabled) is only reached if deinflection also fails.
+
 ## Commands
 
 - `:KanjiToHiraganaDownloadDictionary` — fetch the latest `JmdictFurigana.txt`
@@ -121,8 +127,11 @@ invalidated automatically when the source file's mtime is newer.
 
 ## Limitations
 
-- JmdictFurigana is keyed by dictionary forms; conjugated forms (e.g. 食べた)
-  won't match. Selecting the dictionary form (食べる) works.
+- JmdictFurigana is keyed by dictionary forms. Common verb conjugations
+  (Ichidan, Godan, する/くる irregulars, compound する verbs) are automatically
+  deinflected before lookup — e.g. pressing `<leader>hi` on 食べた will resolve
+  to 食べる's reading. Less common inflected forms or adjective conjugations are
+  not deinflected and will miss.
 - For words missing from the dataset, enable `fallback_to_web = true` to
   continue using the legacy jisho.org scraper.
 

@@ -45,6 +45,10 @@ work because the corresponding production locals are forward-declared so that
 you add new injectables. Stub `vim.api.nvim_echo` in any test that exercises
 `report_error` to keep the busted output clean.
 
+Verb deinflection tests live in `tests/deinflection_spec.lua` and cover
+`deinflect()` unit tests (pure, no index) as well as `lookup_kanji_async()`
+integration tests using a stub index.
+
 ## Architecture quirks
 
 - **Async lookup**: `lookup_kanji_async(kanji, callback)` is callback-based
@@ -52,6 +56,12 @@ you add new injectables. Stub `vim.api.nvim_echo` in any test that exercises
   async. Visual/normal-mode handlers capture the target insertion position
   *before* invoking the lookup, then insert via `nvim_buf_set_text` inside the
   callback. Do not assume the cursor is still where it started.
+- **Verb deinflection**: when a word is not found in the index, `deinflect(word)`
+  generates candidate dictionary forms and the lookup retries each one. Rules
+  cover Ichidan (る-verb), Godan (all nine う-verb columns), irregular する/くる,
+  and compound する verbs. Candidates are over-generated intentionally; the
+  first index hit wins. The web fallback is only reached if all candidates
+  miss. `deinflect` is exposed on `M._internal` for testing.
 - **Multibyte insertion math**: the `'>` mark and `normal! e` give the byte
   offset of the *first byte* of the last character. Code skips the full UTF-8
   codepoint width before inserting; if you touch this, retest with 1/2/3/4-byte
