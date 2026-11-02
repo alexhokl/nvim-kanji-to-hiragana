@@ -176,6 +176,46 @@ describe("deinflect", function()
     it("言います → 言う (う polite)", function()
       assert.is_true(has_candidate("言う", internal.deinflect("言います")))
     end)
+
+    -- Regression: the す progressive rule used to be "していている"
+    it("話している → 話す (す progressive)", function()
+      assert.is_true(has_candidate("話す", internal.deinflect("話している")))
+    end)
+
+    it("話していた → 話す (す progressive past)", function()
+      assert.is_true(has_candidate("話す", internal.deinflect("話していた")))
+    end)
+  end)
+
+  -- Chained forms: derived stems conjugated further
+  describe("chained forms", function()
+    local cases = {
+      -- potential
+      { "書けました", "書く" },
+      { "書けます", "書く" },
+      { "書けた", "書く" },
+      { "書けない", "書く" },
+      -- passive
+      { "書かれました", "書く" },
+      { "書かれた", "書く" },
+      -- causative
+      { "書かせました", "書く" },
+      { "書かせた", "書く" },
+      -- causative-passive
+      { "書かせられる", "書く" },
+      { "書かされる", "書く" },
+      { "書かせれる", "書く" },
+      { "書かせられました", "書く" },
+      { "飲まされた", "飲む" },
+      { "食べさせられました", "食べる" },
+      { "食べさせれる", "食べる" },
+    }
+    for _, case in ipairs(cases) do
+      local word, dict = case[1], case[2]
+      it(word .. " → " .. dict, function()
+        assert.is_true(has_candidate(dict, internal.deinflect(word)))
+      end)
+    end
   end)
 
   -- Irregular verb forms
@@ -352,6 +392,25 @@ describe("lookup_kanji_async with deinflection", function()
     local got
     internal.lookup_kanji_async("言った", function(r) got = r end)
     assert.are.equal("いう", got)
+  end)
+
+  it("話している → callback(はなす) [Godan す progressive]", function()
+    local got
+    internal.lookup_kanji_async("話している", function(r) got = r end)
+    assert.are.equal("はなす", got)
+  end)
+
+  -- Chained
+  it("書けました → callback(かく) [potential polite past]", function()
+    local got
+    internal.lookup_kanji_async("書けました", function(r) got = r end)
+    assert.are.equal("かく", got)
+  end)
+
+  it("書かせれる → callback(かく) [colloquial causative-passive]", function()
+    local got
+    internal.lookup_kanji_async("書かせれる", function(r) got = r end)
+    assert.are.equal("かく", got)
   end)
 
   -- Irregular

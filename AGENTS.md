@@ -62,6 +62,11 @@ integration tests using a stub index.
   and compound する verbs. Candidates are over-generated intentionally; the
   first index hit wins. The web fallback is only reached if all candidates
   miss. `deinflect` is exposed on `M._internal` for testing.
+- **Chained deinflection**: potential, passive, causative and causative-passive
+  stems conjugate like Ichidan verbs, so `deinflect` re-applies the rules
+  breadth-first up to `MAX_DEINFLECT_DEPTH` (書けました → 書ける → 書く). Add
+  only the dictionary-form `る` rule for a new derived form; chaining covers
+  its ます/た/ない endings. Single-step candidates always come first.
 - **Multibyte insertion math**: the `'>` mark and `normal! e` give the byte
   offset of the *first byte* of the last character. Code skips the full UTF-8
   codepoint width before inserting; if you touch this, retest with 1/2/3/4-byte

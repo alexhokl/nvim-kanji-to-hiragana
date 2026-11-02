@@ -488,7 +488,6 @@ local DEINFLECT_RULES = {
   { "ていた", "る", 1 },
   { "ていて", "る", 1 },
   { "ていない", "る", 1 },
-  { "ている", "る", 1 },  -- same as above, shorthand
   -- contracted: 〜てる / 〜てた
   { "てる", "る", 1 },
   { "てた", "る", 1 },
@@ -598,7 +597,9 @@ local DEINFLECT_RULES = {
   -- Godan te-iru (progressive): 〜いている
   { "いている", "く", 1 },
   { "いでいる", "ぐ", 1 },
-  { "していている", "す", 1 },  -- rare but handled
+  { "している", "す", 1 },
+  { "していた", "す", 1 },
+  { "していない", "す", 1 },
   { "っている", "つ", 1 },
   { "んでいる", "ぬ", 1 },
   { "んでいる", "ぶ", 1 },
@@ -679,6 +680,40 @@ local DEINFLECT_RULES = {
   { "らせる", "る", 1 },
   { "わせる", "う", 1 },
 
+  -- Godan causative-passive: a-row + せられる
+  { "かせられる", "く", 1 },
+  { "がせられる", "ぐ", 1 },
+  { "させられる", "す", 1 },
+  { "たせられる", "つ", 1 },
+  { "なせられる", "ぬ", 1 },
+  { "ばせられる", "ぶ", 1 },
+  { "ませられる", "む", 1 },
+  { "らせられる", "る", 1 },
+  { "わせられる", "う", 1 },
+
+  -- Godan causative-passive, short: a-row + される (not used by す-verbs)
+  { "かされる", "く", 1 },
+  { "がされる", "ぐ", 1 },
+  { "たされる", "つ", 1 },
+  { "なされる", "ぬ", 1 },
+  { "ばされる", "ぶ", 1 },
+  { "まされる", "む", 1 },
+  { "らされる", "る", 1 },
+  { "わされる", "う", 1 },
+
+  -- Godan causative-passive, colloquial: a-row + せれる
+  { "かせれる", "く", 1 },
+  { "がせれる", "ぐ", 1 },
+  { "させれる", "す", 1 },
+  { "たせれる", "つ", 1 },
+  { "なせれる", "ぬ", 1 },
+  { "ばせれる", "ぶ", 1 },
+  { "ませれる", "む", 1 },
+  { "らせれる", "る", 1 },
+  { "わせれる", "う", 1 },
+  -- Ichidan causative-passive, colloquial: 〜させれる
+  { "させれる", "る", 1 },
+
   -- Godan volitional: o-row + う
   { "こう", "く", 1 },
   { "ごう", "ぐ", 1 },
@@ -730,7 +765,6 @@ local IRREGULAR_RULES = {
   { "こられる", "くる" },
   { "こい",     "くる" },
   { "くれば",   "くる" },
-  { "きた",     "くる" },
   -- する forms
   { "した",     "する" },
   { "して",     "する" },
@@ -747,19 +781,15 @@ local IRREGULAR_RULES = {
   { "できる",   "する" },  -- potential of する (informal)
 }
 
-local function deinflect(word)
-  if not word or #word == 0 then return {} end
+-- Derived stems (potential, passive, causative, causative-passive) conjugate
+-- like Ichidan verbs, so rules are re-applied to each candidate up to this
+-- depth, e.g. 書けました → 書ける → 書く.
+local MAX_DEINFLECT_DEPTH = 3
+-- Safety cap on the total number of candidates generated.
+local MAX_DEINFLECT_CANDIDATES = 200
 
-  local seen = {}
-  local candidates = {}
-
-  local function add(c)
-    if not seen[c] and c ~= word then
-      seen[c] = true
-      candidates[#candidates + 1] = c
-    end
-  end
-
+-- Applies every rule once to `word`, passing each candidate to `add`.
+local function deinflect_once(word, add)
   -- 1. Irregular rules: match kana tail of `word`.
   for _, rule in ipairs(IRREGULAR_RULES) do
     local conj_tail, dict_tail = rule[1], rule[2]
@@ -793,6 +823,31 @@ local function deinflect(word)
         add(stem .. repl)
       end
     end
+  end
+end
+
+-- Breadth-first, so single-step candidates always precede chained ones.
+local function deinflect(word)
+  if not word or #word == 0 then return {} end
+
+  local seen = { [word] = true }
+  local candidates = {}
+  local level = { word }
+
+  for _ = 1, MAX_DEINFLECT_DEPTH do
+    local next_level = {}
+    local function add(c)
+      if not seen[c] and #candidates < MAX_DEINFLECT_CANDIDATES then
+        seen[c] = true
+        candidates[#candidates + 1] = c
+        next_level[#next_level + 1] = c
+      end
+    end
+    for _, w in ipairs(level) do
+      deinflect_once(w, add)
+    end
+    if #next_level == 0 then break end
+    level = next_level
   end
 
   return candidates

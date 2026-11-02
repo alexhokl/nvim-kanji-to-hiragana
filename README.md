@@ -114,6 +114,9 @@ When the input word is not found directly in the index, the plugin attempts
 verb deinflection: it generates candidate dictionary forms covering Ichidan
 (る-verb), Godan (all nine columns), irregular する/くる, and compound する
 verbs, then retries the index lookup for each candidate. The first hit wins.
+Rules are chained, so derived forms that are conjugated again also resolve,
+e.g. potential 書けました, passive 書かれた, causative 書かせました and
+causative-passive 書かせられる / 書かされる / 書かせれる all resolve to 書く.
 The web fallback (if enabled) is only reached if deinflection also fails.
 
 ## Commands
